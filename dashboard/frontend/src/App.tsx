@@ -1,1 +1,1 @@
-export { default } from './v3/App';
+export { default } from './vijay/Dashboard';
