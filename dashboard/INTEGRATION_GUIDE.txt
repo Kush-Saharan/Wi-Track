@@ -18,10 +18,10 @@ What our backend `csi_parser.py` does:
 
 2. BACKEND MODULES CREATED
 --------------------------------------------------------------------
-The backend is now completely modular:
-- `backend/config.py`: Environment variables & settings (`SERIAL_PORT`, `BAUD_RATE`, `USE_MOCK`).
+The backend is completely modular:
+- `backend/config.py`: Environment variables & settings (`SERIAL_PORT`, `BAUD_RATE`).
 - `backend/csi_parser.py`: Pure line parser for bracketed ESP32 CSI data.
-- `backend/serial_reader.py`: Serial port reader & Mock CSV reader fallback.
+- `backend/serial_reader.py`: Hardware serial port reader.
 - `backend/main.py`: Modular FastAPI server with WebSocket endpoint & model plugin slot.
 
 
@@ -35,10 +35,6 @@ The backend is now completely modular:
 
 4. HOW TO RUN THE BACKEND
 --------------------------------------------------------------------
-With real ESP32 serial data:
+Run with real ESP32 serial data:
   cd dashboard/backend
   SERIAL_PORT=/dev/ttyUSB0 uvicorn main:app --port 8000 --reload
-
-In Mock CSV test mode (without hardware):
-  cd dashboard/backend
-  USE_MOCK=true uvicorn main:app --port 8000 --reload

@@ -3,7 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
-from serial_reader import SerialReader, MockSerialReader
+from serial_reader import SerialReader
 
 app = FastAPI()
 
@@ -15,23 +15,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def create_reader():
-    if config.USE_MOCK:
-        print(f"[Backend] Starting MockSerialReader using CSV: {config.MOCK_CSV_PATH}")
-        return MockSerialReader(config.MOCK_CSV_PATH)
-    else:
-        print(f"[Backend] Starting SerialReader on port {config.SERIAL_PORT} @ {config.BAUD_RATE}")
-        return SerialReader(config.SERIAL_PORT, config.BAUD_RATE)
-
 @app.websocket("/ws/data")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     reader = None
 
     try:
-        reader = create_reader()
+        reader = SerialReader(config.SERIAL_PORT, config.BAUD_RATE)
+        print(f"[Backend] Connected to serial port {config.SERIAL_PORT} @ {config.BAUD_RATE}")
     except Exception as e:
-        await websocket.send_json({"error": f"Failed to initialize serial reader: {e}"})
+        print(f"[Backend] Could not open serial port {config.SERIAL_PORT}: {e}")
+        await websocket.send_json({"error": f"Failed to connect to {config.SERIAL_PORT}"})
         await websocket.close()
         return
 
