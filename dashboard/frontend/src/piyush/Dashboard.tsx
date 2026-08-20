@@ -5,16 +5,14 @@ import {
   useState,
 } from "react";
 import "./piyush.css";
-import { CSIWebSocket } from "./websocket";
+import csiCsvUrl from "./csi_data.csv?url";
 import type {
   CSIData,
   YOLOData,
   ModelData,
 } from "./websocket";
 
-const WS_URL =
-  import.meta.env.VITE_WS_URL ??
-  "ws://localhost:8000/ws/data";
+const RECORDING_FPS = 30;
 
 interface RecordingSession {
   sessionId: string;
@@ -39,6 +37,96 @@ interface YOLODetectionView {
   y?: number;
   width?: number;
   height?: number;
+}
+
+interface SampleCSIFrame {
+  iValues: number[];
+  qValues: number[];
+}
+
+let sampleCSIFramesLoader:
+  | Promise<SampleCSIFrame[]>
+  | null = null;
+
+function parseSampleCSI(
+  csvText: string
+) {
+  const lines =
+    csvText
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean);
+
+  const headers =
+    lines[0]?.split(",") ?? [];
+
+  const iColumns =
+    headers.flatMap(
+      (header, index) =>
+        /^I\d+$/.test(header)
+          ? [index]
+          : []
+    );
+
+  const qColumns =
+    headers.flatMap(
+      (header, index) =>
+        /^Q\d+$/.test(header)
+          ? [index]
+          : []
+    );
+
+  return lines
+    .slice(1)
+    .flatMap((line) => {
+      const cells =
+        line.split(",");
+
+      const iValues =
+        iColumns.map(
+          (index) =>
+            Number(cells[index]) || 0
+        );
+
+      const qValues =
+        qColumns.map(
+          (index) =>
+            Number(cells[index]) || 0
+        );
+
+      if (
+        iValues.length === 0 ||
+        qValues.length === 0
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          iValues,
+          qValues,
+        },
+      ];
+    });
+}
+
+async function loadSampleCSIFrames() {
+  if (!sampleCSIFramesLoader) {
+    sampleCSIFramesLoader =
+      fetch(csiCsvUrl)
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(
+              "Failed to load sample CSI CSV"
+            );
+          }
+
+          return response.text();
+        })
+        .then(parseSampleCSI);
+  }
+
+  return sampleCSIFramesLoader;
 }
 
 function formatTime(seconds: number) {
@@ -158,372 +246,326 @@ function toPercent(
   return undefined;
 }
 
+type OrtTensorData = Float32Array;
 
-interface DownloadEntry {
-  name: string;
-  data: Uint8Array;
+interface OrtTensor {
+  data: OrtTensorData;
+  dims: number[];
 }
 
-const textEncoder = new TextEncoder();
+interface OrtSession {
+  inputNames: string[];
+  outputNames: string[];
+  run(
+    feeds: Record<string, OrtTensor>
+  ): Promise<Record<string, OrtTensor>>;
+}
 
-function crc32(data: Uint8Array): number {
-  let crc = 0xffffffff;
+interface OrtRuntime {
+  env: {
+    wasm: {
+      wasmPaths?: string;
+    };
+  };
+  Tensor: new (
+    type: "float32",
+    data: Float32Array,
+    dims: number[]
+  ) => OrtTensor;
+  InferenceSession: {
+    create(
+      modelPath: string,
+      options?: {
+        executionProviders?: string[];
+      }
+    ): Promise<OrtSession>;
+  };
+}
 
-  for (let i = 0; i < data.length; i++) {
-    crc ^= data[i];
+interface FFmpegInstance {
+  loaded?: boolean;
+  load(options: {
+    coreURL: string;
+    wasmURL: string;
+    classWorkerURL?: string;
+  }): Promise<void>;
+  writeFile(
+    path: string,
+    data: Uint8Array
+  ): Promise<void>;
+  readFile(path: string): Promise<
+    Uint8Array | string
+  >;
+  deleteFile(path: string): Promise<void>;
+  exec(args: string[]): Promise<number>;
+  on(
+    event: "log",
+    handler: (data: {
+      message: string;
+    }) => void
+  ): void;
+}
 
-    for (let bit = 0; bit < 8; bit++) {
-      crc =
-        (crc >>> 1) ^
-        (crc & 1
-          ? 0xedb88320
-          : 0);
-    }
+interface FFmpegModule {
+  FFmpeg: new () => FFmpegInstance;
+}
+
+declare global {
+  interface Window {
+    ort?: OrtRuntime;
+    FFmpegWASM?: FFmpegModule;
   }
-
-  return (crc ^ 0xffffffff) >>> 0;
 }
 
-function writeUint16(
-  view: DataView,
-  offset: number,
-  value: number
-) {
-  view.setUint16(
-    offset,
-    value,
-    true
-  );
-}
+const YOLO_MODEL_PATH =
+  "/yolov8n.onnx";
 
-function writeUint32(
-  view: DataView,
-  offset: number,
-  value: number
-) {
-  view.setUint32(
-    offset,
-    value >>> 0,
-    true
-  );
-}
+const YOLO_SIZE = 640;
 
-function toArrayBuffer(data: Uint8Array): ArrayBuffer {
-  const buffer = new ArrayBuffer(data.byteLength);
-  new Uint8Array(buffer).set(data);
-  return buffer;
-}
+const YOLO_CONFIDENCE_THRESHOLD =
+  0.35;
 
-/*
- * Creates a ZIP file using the ZIP "store"
- * method. No extra package is required.
- *
- * This lets us put CSI, video, YOLO and MODEL
- * data into one downloadable file.
- */
-function createZip(
-  entries: DownloadEntry[]
-): Blob {
-  const localParts: Uint8Array[] = [];
-  const centralParts: Uint8Array[] = [];
+const YOLO_IOU_THRESHOLD =
+  0.45;
 
-  let offset = 0;
+const COCO_CLASSES = [
+  "person",
+  "bicycle",
+  "car",
+  "motorcycle",
+  "airplane",
+  "bus",
+  "train",
+  "truck",
+  "boat",
+  "traffic light",
+  "fire hydrant",
+  "stop sign",
+  "parking meter",
+  "bench",
+  "bird",
+  "cat",
+  "dog",
+  "horse",
+  "sheep",
+  "cow",
+  "elephant",
+  "bear",
+  "zebra",
+  "giraffe",
+  "backpack",
+  "umbrella",
+  "handbag",
+  "tie",
+  "suitcase",
+  "frisbee",
+  "skis",
+  "snowboard",
+  "sports ball",
+  "kite",
+  "baseball bat",
+  "baseball glove",
+  "skateboard",
+  "surfboard",
+  "tennis racket",
+  "bottle",
+  "wine glass",
+  "cup",
+  "fork",
+  "knife",
+  "spoon",
+  "bowl",
+  "banana",
+  "apple",
+  "sandwich",
+  "orange",
+  "broccoli",
+  "carrot",
+  "hot dog",
+  "pizza",
+  "donut",
+  "cake",
+  "chair",
+  "couch",
+  "potted plant",
+  "bed",
+  "dining table",
+  "toilet",
+  "tv",
+  "laptop",
+  "mouse",
+  "remote",
+  "keyboard",
+  "cell phone",
+  "microwave",
+  "oven",
+  "toaster",
+  "sink",
+  "refrigerator",
+  "book",
+  "clock",
+  "vase",
+  "scissors",
+  "teddy bear",
+  "hair drier",
+  "toothbrush",
+];
 
-  for (const entry of entries) {
-    const nameBytes =
-      textEncoder.encode(
-        entry.name
+let ortLoader: Promise<OrtRuntime> | null =
+  null;
+
+let ffmpegLoader:
+  | Promise<FFmpegInstance>
+  | null = null;
+
+function loadScript(
+  src: string
+): Promise<void> {
+  return new Promise(
+    (resolve, reject) => {
+      const existing =
+        document.querySelector(
+          `script[src="${src}"]`
+        );
+
+      if (existing) {
+        resolve();
+        return;
+      }
+
+      const script =
+        document.createElement(
+          "script"
+        );
+
+      script.src = src;
+      script.async = true;
+
+      script.onload = () => {
+        resolve();
+      };
+
+      script.onerror = () => {
+        reject(
+          new Error(
+            `Failed to load ${src}`
+          )
+        );
+      };
+
+      document.head.appendChild(
+        script
       );
-
-    const data = entry.data;
-
-    const checksum =
-      crc32(data);
-
-    const localHeader =
-      new ArrayBuffer(30);
-
-    const localView =
-      new DataView(
-        localHeader
-      );
-
-    writeUint32(
-      localView,
-      0,
-      0x04034b50
-    );
-
-    writeUint16(
-      localView,
-      4,
-      20
-    );
-
-    writeUint16(
-      localView,
-      6,
-      0x0800
-    );
-
-    writeUint16(
-      localView,
-      8,
-      0
-    );
-
-    writeUint16(
-      localView,
-      10,
-      0
-    );
-
-    writeUint16(
-      localView,
-      12,
-      0
-    );
-
-    writeUint32(
-      localView,
-      14,
-      checksum
-    );
-
-    writeUint32(
-      localView,
-      18,
-      data.length
-    );
-
-    writeUint32(
-      localView,
-      22,
-      data.length
-    );
-
-    writeUint16(
-      localView,
-      26,
-      nameBytes.length
-    );
-
-    writeUint16(
-      localView,
-      28,
-      0
-    );
-
-    localParts.push(
-      new Uint8Array(
-        localHeader
-      ),
-      nameBytes,
-      data
-    );
-
-    const centralHeader =
-      new ArrayBuffer(46);
-
-    const centralView =
-      new DataView(
-        centralHeader
-      );
-
-    writeUint32(
-      centralView,
-      0,
-      0x02014b50
-    );
-
-    writeUint16(
-      centralView,
-      4,
-      20
-    );
-
-    writeUint16(
-      centralView,
-      6,
-      20
-    );
-
-    writeUint16(
-      centralView,
-      8,
-      0x0800
-    );
-
-    writeUint16(
-      centralView,
-      10,
-      0
-    );
-
-    writeUint16(
-      centralView,
-      12,
-      0
-    );
-
-    writeUint16(
-      centralView,
-      14,
-      0
-    );
-
-    writeUint32(
-      centralView,
-      16,
-      checksum
-    );
-
-    writeUint32(
-      centralView,
-      20,
-      data.length
-    );
-
-    writeUint32(
-      centralView,
-      24,
-      data.length
-    );
-
-    writeUint16(
-      centralView,
-      28,
-      nameBytes.length
-    );
-
-    writeUint16(
-      centralView,
-      30,
-      0
-    );
-
-    writeUint16(
-      centralView,
-      32,
-      0
-    );
-
-    writeUint16(
-      centralView,
-      34,
-      0
-    );
-
-    writeUint16(
-      centralView,
-      36,
-      0
-    );
-
-    writeUint32(
-      centralView,
-      38,
-      0
-    );
-
-    writeUint32(
-      centralView,
-      42,
-      offset
-    );
-
-    centralParts.push(
-      new Uint8Array(
-        centralHeader
-      ),
-      nameBytes
-    );
-
-    offset +=
-      30 +
-      nameBytes.length +
-      data.length;
-  }
-
-  const centralDirectorySize =
-    centralParts.reduce(
-      (total, part) =>
-        total + part.length,
-      0
-    );
-
-  const centralDirectoryOffset =
-    offset;
-
-  const endRecord =
-    new ArrayBuffer(22);
-
-  const endView =
-    new DataView(
-      endRecord
-    );
-
-  writeUint32(
-    endView,
-    0,
-    0x06054b50
-  );
-
-  writeUint16(
-    endView,
-    4,
-    0
-  );
-
-  writeUint16(
-    endView,
-    6,
-    0
-  );
-
-  writeUint16(
-    endView,
-    8,
-    entries.length
-  );
-
-  writeUint16(
-    endView,
-    10,
-    entries.length
-  );
-
-  writeUint32(
-    endView,
-    12,
-    centralDirectorySize
-  );
-
-  writeUint32(
-    endView,
-    16,
-    centralDirectoryOffset
-  );
-
-  writeUint16(
-    endView,
-    20,
-    0
-  );
-
-  const zipParts: BlobPart[] = [
-    ...localParts.map(toArrayBuffer),
-    ...centralParts.map(toArrayBuffer),
-    endRecord,
-  ];
-
-  return new Blob(
-    zipParts,
-    {
-      type:
-        "application/zip",
     }
   );
+}
+
+async function toBlobURL(
+  url: string,
+  mimeType: string
+) {
+  const response =
+    await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to load ${url}`
+    );
+  }
+
+  const blob =
+    await response.blob();
+
+  return URL.createObjectURL(
+    new Blob([blob], {
+      type: mimeType,
+    })
+  );
+}
+
+async function loadOrtRuntime() {
+  if (!ortLoader) {
+    ortLoader = (async () => {
+      await loadScript(
+        "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"
+      );
+
+      const ort = window.ort;
+
+      if (!ort) {
+        throw new Error(
+          "ONNX Runtime failed to initialize"
+        );
+      }
+
+      ort.env.wasm.wasmPaths =
+        "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+
+      return ort;
+    })();
+  }
+
+  return ortLoader;
+}
+
+async function loadFFmpeg() {
+  if (!ffmpegLoader) {
+    ffmpegLoader = (async () => {
+      await loadScript(
+        "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"
+      );
+
+      const ffmpegModule =
+        window.FFmpegWASM;
+
+      if (!ffmpegModule) {
+        throw new Error(
+          "ffmpeg.wasm failed to initialize"
+        );
+      }
+
+      const ffmpeg =
+        new ffmpegModule.FFmpeg();
+
+      ffmpeg.on(
+        "log",
+        ({ message }) => {
+          console.log(
+            "[Wi-Track] ffmpeg:",
+            message
+          );
+        }
+      );
+
+      const ffmpegBaseURL =
+        "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd";
+
+      const coreBaseURL =
+        "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+
+      await ffmpeg.load({
+        classWorkerURL:
+          await toBlobURL(
+            `${ffmpegBaseURL}/814.ffmpeg.js`,
+            "text/javascript"
+          ),
+        coreURL:
+          await toBlobURL(
+            `${coreBaseURL}/ffmpeg-core.js`,
+            "text/javascript"
+          ),
+        wasmURL:
+          await toBlobURL(
+            `${coreBaseURL}/ffmpeg-core.wasm`,
+            "application/wasm"
+          ),
+      });
+
+      return ffmpeg;
+    })();
+  }
+
+  return ffmpegLoader;
 }
 
 function blobToUint8Array(
@@ -535,6 +577,480 @@ function blobToUint8Array(
       (buffer) =>
         new Uint8Array(buffer)
     );
+}
+
+function createYOLOInput(
+  video: HTMLVideoElement
+) {
+  const canvas =
+    document.createElement(
+      "canvas"
+    );
+
+  canvas.width = YOLO_SIZE;
+  canvas.height = YOLO_SIZE;
+
+  const context =
+    canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error(
+      "Could not prepare YOLO canvas"
+    );
+  }
+
+  const sourceWidth =
+    video.videoWidth || 1;
+
+  const sourceHeight =
+    video.videoHeight || 1;
+
+  const scale =
+    Math.min(
+      YOLO_SIZE / sourceWidth,
+      YOLO_SIZE / sourceHeight
+    );
+
+  const drawWidth =
+    sourceWidth * scale;
+
+  const drawHeight =
+    sourceHeight * scale;
+
+  const padX =
+    (YOLO_SIZE - drawWidth) / 2;
+
+  const padY =
+    (YOLO_SIZE - drawHeight) / 2;
+
+  context.fillStyle = "#727272";
+  context.fillRect(
+    0,
+    0,
+    YOLO_SIZE,
+    YOLO_SIZE
+  );
+
+  context.drawImage(
+    video,
+    padX,
+    padY,
+    drawWidth,
+    drawHeight
+  );
+
+  const pixels =
+    context.getImageData(
+      0,
+      0,
+      YOLO_SIZE,
+      YOLO_SIZE
+    ).data;
+
+  const input =
+    new Float32Array(
+      3 * YOLO_SIZE * YOLO_SIZE
+    );
+
+  const planeSize =
+    YOLO_SIZE * YOLO_SIZE;
+
+  for (
+    let pixelIndex = 0;
+    pixelIndex < planeSize;
+    pixelIndex += 1
+  ) {
+    const sourceIndex =
+      pixelIndex * 4;
+
+    input[pixelIndex] =
+      pixels[sourceIndex] / 255;
+
+    input[
+      planeSize + pixelIndex
+    ] =
+      pixels[
+        sourceIndex + 1
+      ] / 255;
+
+    input[
+      planeSize * 2 +
+        pixelIndex
+    ] =
+      pixels[
+        sourceIndex + 2
+      ] / 255;
+  }
+
+  return {
+    input,
+    sourceWidth,
+    sourceHeight,
+    scale,
+    padX,
+    padY,
+  };
+}
+
+function boxIou(
+  a: YOLODetectionView,
+  b: YOLODetectionView
+) {
+  const ax1 = a.x ?? 0;
+  const ay1 = a.y ?? 0;
+  const ax2 =
+    ax1 + (a.width ?? 0);
+  const ay2 =
+    ay1 + (a.height ?? 0);
+
+  const bx1 = b.x ?? 0;
+  const by1 = b.y ?? 0;
+  const bx2 =
+    bx1 + (b.width ?? 0);
+  const by2 =
+    by1 + (b.height ?? 0);
+
+  const intersectionWidth =
+    Math.max(
+      0,
+      Math.min(ax2, bx2) -
+        Math.max(ax1, bx1)
+    );
+
+  const intersectionHeight =
+    Math.max(
+      0,
+      Math.min(ay2, by2) -
+        Math.max(ay1, by1)
+    );
+
+  const intersection =
+    intersectionWidth *
+    intersectionHeight;
+
+  const union =
+    (a.width ?? 0) *
+      (a.height ?? 0) +
+    (b.width ?? 0) *
+      (b.height ?? 0) -
+    intersection;
+
+  return union <= 0
+    ? 0
+    : intersection / union;
+}
+
+function nonMaxSuppression(
+  detections: YOLODetectionView[]
+) {
+  const sorted = [
+    ...detections,
+  ].sort(
+    (a, b) =>
+      b.confidence -
+      a.confidence
+  );
+
+  const selected: YOLODetectionView[] =
+    [];
+
+  for (const detection of sorted) {
+    const overlaps =
+      selected.some(
+        (picked) =>
+          detection.label ===
+            picked.label &&
+          boxIou(
+            detection,
+            picked
+          ) > YOLO_IOU_THRESHOLD
+      );
+
+    if (!overlaps) {
+      selected.push(
+        detection
+      );
+    }
+
+    if (selected.length >= 8) {
+      break;
+    }
+  }
+
+  return selected;
+}
+
+function parseYOLOOutput(
+  tensor: OrtTensor,
+  meta: ReturnType<
+    typeof createYOLOInput
+  >
+) {
+  const data = tensor.data;
+  const dims = tensor.dims;
+
+  if (dims.length < 3) {
+    return [];
+  }
+
+  const first = dims[1];
+  const second = dims[2];
+  const transposed =
+    first < second;
+
+  const boxCount =
+    transposed ? second : first;
+
+  const attributes =
+    transposed ? first : second;
+
+  const classOffset =
+    attributes > 84 ? 5 : 4;
+
+  const classCount =
+    attributes - classOffset;
+
+  const detections: YOLODetectionView[] =
+    [];
+
+  for (
+    let boxIndex = 0;
+    boxIndex < boxCount;
+    boxIndex += 1
+  ) {
+    const valueAt = (
+      attribute: number
+    ) =>
+      transposed
+        ? data[
+            attribute *
+              boxCount +
+              boxIndex
+          ]
+        : data[
+            boxIndex *
+              attributes +
+              attribute
+          ];
+
+    const objectness =
+      classOffset === 5
+        ? valueAt(4)
+        : 1;
+
+    let bestClass = 0;
+    let bestScore = 0;
+
+    for (
+      let classIndex = 0;
+      classIndex < classCount;
+      classIndex += 1
+    ) {
+      const score =
+        valueAt(
+          classOffset +
+            classIndex
+        ) * objectness;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestClass = classIndex;
+      }
+    }
+
+    if (
+      bestScore <
+      YOLO_CONFIDENCE_THRESHOLD
+    ) {
+      continue;
+    }
+
+    const centerX =
+      valueAt(0);
+    const centerY =
+      valueAt(1);
+    const width = valueAt(2);
+    const height = valueAt(3);
+
+    const x =
+      (centerX -
+        width / 2 -
+        meta.padX) /
+      meta.scale;
+
+    const y =
+      (centerY -
+        height / 2 -
+        meta.padY) /
+      meta.scale;
+
+    detections.push({
+      label:
+        COCO_CLASSES[
+          bestClass
+        ] ?? `class ${bestClass}`,
+      confidence:
+        bestScore,
+      x: Math.max(
+        0,
+        Math.min(
+          x,
+          meta.sourceWidth
+        )
+      ),
+      y: Math.max(
+        0,
+        Math.min(
+          y,
+          meta.sourceHeight
+        )
+      ),
+      width: Math.max(
+        0,
+        Math.min(
+          width / meta.scale,
+          meta.sourceWidth
+        )
+      ),
+      height: Math.max(
+        0,
+        Math.min(
+          height / meta.scale,
+          meta.sourceHeight
+        )
+      ),
+    });
+  }
+
+  return nonMaxSuppression(
+    detections
+  );
+}
+
+function drawGraphCanvas(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  iValues: number[],
+  qValues: number[]
+) {
+  context.fillStyle = "#0d1219";
+  context.fillRect(
+    0,
+    0,
+    width,
+    height
+  );
+
+  context.strokeStyle = "#1b222c";
+  context.lineWidth = 1;
+
+  for (
+    let x = 40;
+    x < width;
+    x += 40
+  ) {
+    context.beginPath();
+    context.moveTo(x, 48);
+    context.lineTo(
+      x,
+      height - 42
+    );
+    context.stroke();
+  }
+
+  for (
+    let y = 48;
+    y < height - 42;
+    y += 40
+  ) {
+    context.beginPath();
+    context.moveTo(28, y);
+    context.lineTo(
+      width - 24,
+      y
+    );
+    context.stroke();
+  }
+
+  context.fillStyle = "#aeb8c7";
+  context.font =
+    "700 22px system-ui";
+  context.fillText(
+    "CSI GRAPH",
+    28,
+    34
+  );
+
+  context.font =
+    "700 16px system-ui";
+  context.fillStyle = "#60a5fa";
+  context.fillText("I", 28, 90);
+
+  context.fillStyle = "#c084fc";
+  context.fillText(
+    "Q",
+    28,
+    134
+  );
+
+  const drawWave = (
+    values: number[],
+    color: string
+  ) => {
+    if (values.length < 2) {
+      return;
+    }
+
+    const min =
+      Math.min(...values);
+
+    const max =
+      Math.max(...values);
+
+    const range =
+      max - min || 1;
+
+    const plotLeft = 48;
+    const plotTop = 58;
+    const plotWidth =
+      width - 78;
+    const plotHeight =
+      height - 112;
+
+    context.beginPath();
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+
+    values.forEach(
+      (value, index) => {
+        const x =
+          plotLeft +
+          (index /
+            (values.length -
+              1)) *
+            plotWidth;
+
+        const y =
+          plotTop +
+          plotHeight -
+          ((value - min) /
+            range) *
+            plotHeight;
+
+        if (index === 0) {
+          context.moveTo(x, y);
+        } else {
+          context.lineTo(x, y);
+        }
+      }
+    );
+
+    context.stroke();
+  };
+
+  drawWave(iValues, "#60a5fa");
+  drawWave(qValues, "#c084fc");
 }
 
 function Dashboard() {
@@ -593,8 +1109,8 @@ function Dashboard() {
     >("IDLE");
 
   /*
-   * Current I/Q values received from the
-   * backend WebSocket.
+   * Current I/Q values from the
+   * sample CSI stream.
    */
   const [iData, setIData] =
     useState<number[]>([]);
@@ -620,26 +1136,81 @@ function Dashboard() {
   const [currentModel, setCurrentModel] =
     useState<ModelData | null>(null);
 
-  const websocketRef =
-    useRef<CSIWebSocket | null>(null);
+  const sampleIndexRef =
+    useRef(0);
+
+  const sampleFramesRef =
+    useRef<SampleCSIFrame[]>([]);
 
   const videoRef =
     useRef<HTMLVideoElement | null>(null);
 
+  const sourceVideoRef =
+    useRef<HTMLVideoElement | null>(
+      null
+    );
+
   const cameraStreamRef =
     useRef<MediaStream | null>(null);
 
-  const videoChunksRef =
-    useRef<Blob[]>([]);
-
   const mediaRecorderRef =
+    useRef<MediaRecorder | null>(null);
+
+  const graphRecorderRef =
     useRef<MediaRecorder | null>(null);
 
   const recordedVideoRef =
     useRef<Blob | null>(null);
 
+  const recordedGraphRef =
+    useRef<Blob | null>(null);
+
   const videoPlaybackUrl =
     useRef<string | null>(null);
+
+  const cameraCanvasRef =
+    useRef<HTMLCanvasElement | null>(
+      null
+    );
+
+  const graphCanvasRef =
+    useRef<HTMLCanvasElement | null>(
+      null
+    );
+
+  const cameraChunksRef =
+    useRef<Blob[]>([]);
+
+  const graphChunksRef =
+    useRef<Blob[]>([]);
+
+  const renderFrameRef =
+    useRef<number | null>(null);
+
+  const yoloSessionRef =
+    useRef<OrtSession | null>(
+      null
+    );
+
+  const yoloLoopRef =
+    useRef<number | null>(null);
+
+  const yoloRunningRef =
+    useRef(false);
+
+  const iDataRef =
+    useRef<number[]>([]);
+
+  const qDataRef =
+    useRef<number[]>([]);
+
+  const currentYOLORef =
+    useRef<YOLOData | null>(
+      null
+    );
+
+  const isRecordingRef =
+    useRef(false);
 
   /*
    * REAL-TIME recording timer.
@@ -678,13 +1249,17 @@ function Dashboard() {
    */
   useEffect(() => {
     return () => {
-      websocketRef.current?.disconnect();
-
       cameraStreamRef.current
         ?.getTracks()
         .forEach((track) => {
           track.stop();
         });
+
+      if (sourceVideoRef.current) {
+        sourceVideoRef.current.pause();
+        sourceVideoRef.current.srcObject =
+          null;
+      }
 
       if (
         mediaRecorderRef.current &&
@@ -693,6 +1268,35 @@ function Dashboard() {
       ) {
         mediaRecorderRef.current.stop();
       }
+
+      if (
+        graphRecorderRef.current &&
+        graphRecorderRef.current
+          .state !== "inactive"
+      ) {
+        graphRecorderRef.current.stop();
+      }
+
+      if (
+        renderFrameRef.current !==
+        null
+      ) {
+        window.clearInterval(
+          renderFrameRef.current
+        );
+      }
+
+      if (
+        yoloLoopRef.current !==
+        null
+      ) {
+        window.clearTimeout(
+          yoloLoopRef.current
+        );
+      }
+
+      yoloRunningRef.current =
+        false;
 
       if (
         videoPlaybackUrl.current
@@ -753,7 +1357,7 @@ function Dashboard() {
   ]);
 
   /*
-   * Find the backend CSI frame nearest to
+   * Find the sample CSI frame nearest to
    * the selected inspection timestamp.
    */
   const showCSIAtTime = (time: number) => {
@@ -788,10 +1392,16 @@ function Dashboard() {
     }
 
     if (closest.iValues?.length) {
+      iDataRef.current =
+        closest.iValues;
+
       setIData(closest.iValues);
     }
 
     if (closest.qValues?.length) {
+      qDataRef.current =
+        closest.qValues;
+
       setQData(closest.qValues);
     }
   };
@@ -816,6 +1426,31 @@ function Dashboard() {
 
         cameraStreamRef.current =
           stream;
+
+        const sourceVideo =
+          document.createElement(
+            "video"
+          );
+
+        sourceVideo.muted = true;
+        sourceVideo.playsInline = true;
+        sourceVideo.srcObject = stream;
+
+        await sourceVideo
+          .play()
+          .catch(() => {});
+
+        sourceVideoRef.current =
+          sourceVideo;
+
+        if (videoRef.current) {
+          videoRef.current.srcObject =
+            stream;
+
+          await videoRef.current
+            .play()
+            .catch(() => {});
+        }
 
         const track =
           stream.getVideoTracks()[0];
@@ -846,19 +1481,413 @@ function Dashboard() {
       }
     };
 
+  const drawCameraCanvas = () => {
+    const canvas =
+      cameraCanvasRef.current;
+
+    const video =
+      sourceVideoRef.current ??
+      videoRef.current;
+
+    if (
+      !canvas ||
+      !video
+    ) {
+      return;
+    }
+
+    const context =
+      canvas.getContext("2d");
+
+    if (!context) {
+      return;
+    }
+
+    const width = canvas.width;
+    const height = canvas.height;
+
+    context.fillStyle = "#05070a";
+    context.fillRect(
+      0,
+      0,
+      width,
+      height
+    );
+
+    const sourceWidth =
+      video.videoWidth || width;
+
+    const sourceHeight =
+      video.videoHeight || height;
+
+    const scale =
+      Math.max(
+        width / sourceWidth,
+        height / sourceHeight
+      );
+
+    const drawWidth =
+      sourceWidth * scale;
+
+    const drawHeight =
+      sourceHeight * scale;
+
+    const offsetX =
+      (width - drawWidth) / 2;
+
+    const offsetY =
+      (height - drawHeight) / 2;
+
+    if (video.readyState >= 2) {
+      context.drawImage(
+        video,
+        offsetX,
+        offsetY,
+        drawWidth,
+        drawHeight
+      );
+    }
+
+    const detection =
+      currentYOLORef.current
+        ?.detections?.[0] as
+        | YOLODetectionView
+        | undefined;
+
+    if (
+      detection?.x !==
+        undefined &&
+      detection.y !==
+        undefined &&
+      detection.width !==
+        undefined &&
+      detection.height !==
+        undefined
+    ) {
+      const x =
+        offsetX +
+        detection.x * scale;
+
+      const y =
+        offsetY +
+        detection.y * scale;
+
+      const boxWidth =
+        detection.width * scale;
+
+      const boxHeight =
+        detection.height * scale;
+
+      context.strokeStyle =
+        "#39ff88";
+      context.lineWidth = 4;
+      context.strokeRect(
+        x,
+        y,
+        boxWidth,
+        boxHeight
+      );
+
+      const label =
+        `${detection.label} ${(
+          detection.confidence *
+          100
+        ).toFixed(1)}%`;
+
+      context.font =
+        "700 18px system-ui";
+
+      const labelWidth =
+        context.measureText(
+          label
+        ).width + 18;
+
+      const labelY =
+        Math.max(0, y - 30);
+
+      context.fillStyle =
+        "#39ff88";
+      context.fillRect(
+        x,
+        labelY,
+        labelWidth,
+        28
+      );
+
+      context.fillStyle =
+        "#07110b";
+      context.fillText(
+        label,
+        x + 9,
+        labelY + 20
+      );
+    }
+
+    context.fillStyle =
+      "rgba(0, 0, 0, 0.55)";
+    context.fillRect(
+      0,
+      height - 42,
+      width,
+      42
+    );
+
+    context.fillStyle = "#e8edf5";
+    context.font =
+      "700 18px system-ui";
+    context.fillText(
+      "CAMERA",
+      22,
+      height - 16
+    );
+  };
+
+  const acceptNextCSIFrame =
+    () => {
+      const frames =
+        sampleFramesRef.current;
+
+      if (
+        !isRecordingRef.current ||
+        frames.length === 0
+      ) {
+        return;
+      }
+
+      const frame =
+        frames[
+          sampleIndexRef.current %
+            frames.length
+        ];
+
+      sampleIndexRef.current += 1;
+
+      handleCSIData([
+        {
+          timestamp: Date.now(),
+          i: frame.iValues[0] ?? 0,
+          q: frame.qValues[0] ?? 0,
+          iValues: frame.iValues,
+          qValues: frame.qValues,
+        },
+      ]);
+    };
+
+  const drawRecordingCanvases =
+    () => {
+      acceptNextCSIFrame();
+
+      drawCameraCanvas();
+
+      const graphCanvas =
+        graphCanvasRef.current;
+
+      const graphContext =
+        graphCanvas?.getContext(
+          "2d"
+        );
+
+      if (
+        graphCanvas &&
+        graphContext
+      ) {
+        drawGraphCanvas(
+          graphContext,
+          graphCanvas.width,
+          graphCanvas.height,
+          iDataRef.current,
+          qDataRef.current
+        );
+      }
+
+    };
+
+  const startRenderLoop = () => {
+    if (
+      renderFrameRef.current !==
+      null
+    ) {
+      window.clearInterval(
+        renderFrameRef.current
+      );
+    }
+
+    drawRecordingCanvases();
+
+    renderFrameRef.current =
+      window.setInterval(
+        drawRecordingCanvases,
+        1000 / RECORDING_FPS
+      );
+  };
+
+  const stopRenderLoop = () => {
+    if (
+      renderFrameRef.current !==
+      null
+    ) {
+      window.clearInterval(
+        renderFrameRef.current
+      );
+
+      renderFrameRef.current =
+        null;
+    }
+  };
+
+  const startYOLO = () => {
+    yoloRunningRef.current =
+      true;
+
+    const run = async () => {
+      if (
+        !yoloRunningRef.current
+      ) {
+        return;
+      }
+
+      try {
+        const video =
+          sourceVideoRef.current ??
+          videoRef.current;
+
+        if (
+          video &&
+          video.readyState >= 2
+        ) {
+          const ort =
+            await loadOrtRuntime();
+
+          if (
+            !yoloSessionRef.current
+          ) {
+            yoloSessionRef.current =
+              await ort.InferenceSession.create(
+                YOLO_MODEL_PATH,
+                {
+                  executionProviders:
+                    ["wasm"],
+                }
+              );
+          }
+
+          const session =
+            yoloSessionRef.current;
+
+          const meta =
+            createYOLOInput(
+              video
+            );
+
+          const inputName =
+            session.inputNames[0];
+
+          const outputName =
+            session.outputNames[0];
+
+          const tensor =
+            new ort.Tensor(
+              "float32",
+              meta.input,
+              [
+                1,
+                3,
+                YOLO_SIZE,
+                YOLO_SIZE,
+              ]
+            );
+
+          const result =
+            await session.run({
+              [inputName]: tensor,
+            });
+
+          const detections =
+            parseYOLOOutput(
+              result[outputName],
+              meta
+            );
+
+          const payload: YOLOData =
+            {
+              timestamp:
+                Date.now(),
+              detections,
+            };
+
+          handleYOLOData(payload);
+        }
+      } catch (error) {
+        console.error(
+          "[Wi-Track] YOLO inference error:",
+          error
+        );
+      }
+
+      if (
+        yoloRunningRef.current
+      ) {
+        yoloLoopRef.current =
+          window.setTimeout(
+            run,
+            450
+          );
+      }
+    };
+
+    void run();
+  };
+
+  const stopYOLO = () => {
+    yoloRunningRef.current =
+      false;
+
+    if (
+      yoloLoopRef.current !==
+      null
+    ) {
+      window.clearTimeout(
+        yoloLoopRef.current
+      );
+
+      yoloLoopRef.current =
+        null;
+    }
+  };
+
   /*
    * START VIDEO RECORDING.
    */
   const startVideoRecording =
     (): boolean => {
-      const stream =
-        cameraStreamRef.current;
+      const video =
+        sourceVideoRef.current ??
+        videoRef.current;
 
-      if (!stream) {
+      if (!video) {
         return false;
       }
 
       try {
+        cameraCanvasRef.current =
+          document.createElement(
+            "canvas"
+          );
+
+        graphCanvasRef.current =
+          document.createElement(
+            "canvas"
+          );
+
+        cameraCanvasRef.current.width =
+          640;
+        cameraCanvasRef.current.height =
+          720;
+        graphCanvasRef.current.width =
+          640;
+        graphCanvasRef.current.height =
+          720;
+
         let mimeType =
           "video/webm;codecs=vp9";
 
@@ -880,15 +1909,36 @@ function Dashboard() {
             "video/webm";
         }
 
+        const cameraStream =
+          cameraCanvasRef.current.captureStream(
+            RECORDING_FPS
+          );
+
+        const graphStream =
+          graphCanvasRef.current.captureStream(
+            RECORDING_FPS
+          );
+
         const recorder =
           new MediaRecorder(
-            stream,
+            cameraStream,
             {
               mimeType,
             }
           );
 
-        videoChunksRef.current =
+        const graphRecorder =
+          new MediaRecorder(
+            graphStream,
+            {
+              mimeType,
+            }
+          );
+
+        cameraChunksRef.current =
+          [];
+
+        graphChunksRef.current =
           [];
 
         recorder.ondataavailable =
@@ -897,7 +1947,19 @@ function Dashboard() {
               event.data.size >
               0
             ) {
-              videoChunksRef.current.push(
+              cameraChunksRef.current.push(
+                event.data
+              );
+            }
+          };
+
+        graphRecorder.ondataavailable =
+          (event) => {
+            if (
+              event.data.size >
+              0
+            ) {
+              graphChunksRef.current.push(
                 event.data
               );
             }
@@ -906,7 +1968,7 @@ function Dashboard() {
         recorder.onstop = () => {
           const blob =
             new Blob(
-              videoChunksRef.current,
+              cameraChunksRef.current,
               {
                 type:
                   recorder.mimeType ||
@@ -935,10 +1997,28 @@ function Dashboard() {
             );
         };
 
+        graphRecorder.onstop =
+          () => {
+            recordedGraphRef.current =
+              new Blob(
+                graphChunksRef.current,
+                {
+                  type:
+                    graphRecorder.mimeType ||
+                    "video/webm",
+                }
+              );
+          };
+
         recorder.start(1000);
+
+        graphRecorder.start(1000);
 
         mediaRecorderRef.current =
           recorder;
+
+        graphRecorderRef.current =
+          graphRecorder;
 
         setVideoStatus(
           "RECORDING"
@@ -960,35 +2040,193 @@ function Dashboard() {
    */
   const stopVideoRecording =
     (): Promise<void> => {
+      const stopRecorder = (
+        recorder: MediaRecorder | null
+      ) =>
+        new Promise<void>(
+          (resolve) => {
+            if (
+              !recorder ||
+              recorder.state ===
+                "inactive"
+            ) {
+              resolve();
+              return;
+            }
+
+            recorder.addEventListener(
+              "stop",
+              () => {
+                resolve();
+              },
+              {
+                once: true,
+              }
+            );
+
+            recorder.stop();
+          }
+        );
+
       return new Promise(
         (resolve) => {
           const recorder =
             mediaRecorderRef.current;
 
           if (
-            !recorder ||
-            recorder.state ===
-              "inactive"
+            (!recorder ||
+              recorder.state ===
+                "inactive") &&
+            (!graphRecorderRef.current ||
+              graphRecorderRef.current
+                .state ===
+                "inactive")
           ) {
             resolve();
             return;
           }
 
-          recorder.addEventListener(
-            "stop",
-            () => {
-              resolve();
-            },
-            {
-              once: true,
-            }
-          );
-
           setVideoStatus(
             "PROCESSING"
           );
 
-          recorder.stop();
+          stopRenderLoop();
+
+          Promise.all([
+            stopRecorder(
+              recorder
+            ),
+            stopRecorder(
+              graphRecorderRef.current
+            ),
+          ]).then(() => {
+            window.setTimeout(
+              () => {
+                setVideoStatus(
+                  "READY"
+                );
+
+                resolve();
+              },
+              0
+            );
+          });
+        }
+      );
+    };
+
+  const renderStitchedMp4 =
+    async () => {
+      if (
+        !recordedVideoRef.current ||
+        !recordedGraphRef.current
+      ) {
+        throw new Error(
+          "Recorded camera or CSI graph video is missing"
+        );
+      }
+
+      const ffmpeg =
+        await loadFFmpeg();
+
+      await ffmpeg.writeFile(
+        "camera.webm",
+        await blobToUint8Array(
+          recordedVideoRef.current
+        )
+      );
+
+      await ffmpeg.writeFile(
+        "graph.webm",
+        await blobToUint8Array(
+          recordedGraphRef.current
+        )
+      );
+
+      const filter =
+        "[0:v]scale=640:720:force_original_aspect_ratio=decrease,pad=640:720:(ow-iw)/2:(oh-ih)/2:black[left];[1:v]scale=640:720[right];[left][right]hstack=inputs=2[v]";
+
+      try {
+        await ffmpeg.exec([
+          "-i",
+          "camera.webm",
+          "-i",
+          "graph.webm",
+          "-filter_complex",
+          filter,
+          "-map",
+          "[v]",
+          "-an",
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          "-movflags",
+          "faststart",
+          "stitched.mp4",
+        ]);
+      } catch (error) {
+        console.warn(
+          "[Wi-Track] H.264 export failed, retrying MPEG-4 MP4",
+          error
+        );
+
+        await ffmpeg.exec([
+          "-i",
+          "camera.webm",
+          "-i",
+          "graph.webm",
+          "-filter_complex",
+          filter,
+          "-map",
+          "[v]",
+          "-an",
+          "-c:v",
+          "mpeg4",
+          "-q:v",
+          "4",
+          "stitched.mp4",
+        ]);
+      }
+
+      const output =
+        await ffmpeg.readFile(
+          "stitched.mp4"
+        );
+
+      await Promise.allSettled([
+        ffmpeg.deleteFile(
+          "camera.webm"
+        ),
+        ffmpeg.deleteFile(
+          "graph.webm"
+        ),
+        ffmpeg.deleteFile(
+          "stitched.mp4"
+        ),
+      ]);
+
+      if (
+        typeof output === "string"
+      ) {
+        throw new Error(
+          "ffmpeg returned invalid MP4 data"
+        );
+      }
+
+      const buffer =
+        new ArrayBuffer(
+          output.byteLength
+        );
+
+      new Uint8Array(buffer).set(
+        output
+      );
+
+      return new Blob(
+        [buffer],
+        {
+          type: "video/mp4",
         }
       );
     };
@@ -1006,6 +2244,14 @@ function Dashboard() {
     cameraStreamRef.current =
       null;
 
+    if (sourceVideoRef.current) {
+      sourceVideoRef.current.pause();
+      sourceVideoRef.current.srcObject =
+        null;
+      sourceVideoRef.current =
+        null;
+    }
+
     setCameraStatus("OFF");
 
     setCameraName(
@@ -1014,10 +2260,7 @@ function Dashboard() {
   };
 
   /*
-   * WebSocket CSI handler.
-   *
-   * Later this will receive the
-   * REAL backend CSI data.
+   * CSI sample handler.
    */
   const handleCSIData = (
     data: CSIData[]
@@ -1030,10 +2273,6 @@ function Dashboard() {
       recordedSamples.current.length
     );
 
-    if (!isRecording) {
-      return;
-    }
-
     const latest =
       data[data.length - 1];
 
@@ -1042,20 +2281,33 @@ function Dashboard() {
     }
 
     if (latest.iValues?.length) {
+      iDataRef.current =
+        latest.iValues;
+
       setIData(latest.iValues);
     }
 
     if (latest.qValues?.length) {
+      qDataRef.current =
+        latest.qValues;
+
       setQData(latest.qValues);
+    }
+
+    if (!isRecordingRef.current) {
+      return;
     }
   };
 
   /*
-   * WebSocket YOLO handler.
+   * YOLO sample handler.
    */
   const handleYOLOData = (
     data: YOLOData
   ) => {
+    currentYOLORef.current =
+      data;
+
     setYoloHistory((previous) => [
       ...previous,
       data,
@@ -1080,6 +2332,9 @@ function Dashboard() {
       yoloHistory.length === 0 ||
       !startedAt
     ) {
+      currentYOLORef.current =
+        null;
+
       setCurrentYOLO(null);
       return;
     }
@@ -1116,26 +2371,10 @@ function Dashboard() {
       }
     }
 
+    currentYOLORef.current =
+      closest;
+
     setCurrentYOLO(closest);
-  };
-
-  /*
-   * WebSocket MODEL handler.
-   */
-  const handleModelData = (
-    data: ModelData
-  ) => {
-    setModelHistory((previous) => [
-      ...previous,
-      data,
-    ]);
-
-    setCurrentModel(data);
-
-    console.log(
-      "[Wi-Track] MODEL data received:",
-      data
-    );
   };
 
   /*
@@ -1173,6 +2412,28 @@ function Dashboard() {
 
     setCurrentModel(closest);
   };
+
+  const stopSampleCSI = () => {
+    sampleFramesRef.current = [];
+    sampleIndexRef.current = 0;
+  };
+
+  const startSampleCSI =
+    async () => {
+      const frames =
+        await loadSampleCSIFrames();
+
+      sampleFramesRef.current =
+        frames;
+
+      sampleIndexRef.current = 0;
+
+      stopSampleCSI();
+
+      setConnectionStatus(
+        "CONNECTED"
+      );
+    };
 
   /*
    * START EVERYTHING.
@@ -1221,14 +2482,26 @@ function Dashboard() {
 
     setLastSession(null);
 
+    recordedVideoRef.current =
+      null;
+
+    recordedGraphRef.current =
+      null;
+
+    iDataRef.current = [];
+    qDataRef.current = [];
+    currentYOLORef.current =
+      null;
+
     setIsRecording(true);
 
-    /*
-     * WebSocket connection.
-     */
+    isRecordingRef.current =
+      true;
+
     setConnectionStatus(
       "CONNECTING"
     );
+
     /*
      * Clear results from the previous session.
      */
@@ -1238,32 +2511,11 @@ function Dashboard() {
     setCurrentModel(null);
     setSampleCount(0);
 
-    const websocket =
-      new CSIWebSocket(
-        WS_URL,
-        handleCSIData,
-        handleYOLOData,
-        handleModelData,
-        () => {
-          setConnectionStatus(
-            "CONNECTED"
-          );
-        },
-        () => {
-          setConnectionStatus(
-            "DISCONNECTED"
-          );
-        },
-        () => {
-          setConnectionStatus(
-            "ERROR"
-          );
-        }
-      );
-    websocketRef.current =
-      websocket;
+    await startSampleCSI();
 
-    websocket.connect();
+    startRenderLoop();
+
+    startYOLO();
   };
 
   /*
@@ -1281,6 +2533,8 @@ function Dashboard() {
       elapsedTime;
 
     await stopVideoRecording();
+
+    stopYOLO();
 
     const stoppedAt =
       new Date().toISOString();
@@ -1311,10 +2565,10 @@ function Dashboard() {
 
     setIsRecording(false);
 
-    websocketRef.current?.disconnect();
+    isRecordingRef.current =
+      false;
 
-    websocketRef.current =
-      null;
+    stopSampleCSI();
 
     setConnectionStatus(
       "DISCONNECTED"
@@ -1388,8 +2642,8 @@ function Dashboard() {
   };
 
   /*
-   * Download CSI CSV generated
-   * from the actual recorded session.
+   * Download the stitched MP4 generated
+   * from the camera and CSI graph streams.
    */
   const handleDownload =
     async () => {
@@ -1397,212 +2651,30 @@ function Dashboard() {
         return;
       }
 
-      const sessionStart =
-        new Date(
-          lastSession.startedAt
-        ).getTime();
+      setVideoStatus(
+        "PROCESSING"
+      );
 
-      /*
-       * Build a complete CSI CSV.
-       *
-       * If the backend sends full I/Q arrays,
-       * we preserve every subcarrier.
-       */
-      const maxIValues =
-        lastSession.samples.reduce(
-          (
-            maximum,
-            sample
-          ) =>
-            Math.max(
-              maximum,
-              sample.iValues
-                ?.length ?? 0
-            ),
-          0
+      let mp4Blob: Blob;
+
+      try {
+        mp4Blob =
+          await renderStitchedMp4();
+      } catch (error) {
+        console.error(
+          "[Wi-Track] MP4 export failed:",
+          error
         );
 
-      const maxQValues =
-        lastSession.samples.reduce(
-          (
-            maximum,
-            sample
-          ) =>
-            Math.max(
-              maximum,
-              sample.qValues
-                ?.length ?? 0
-            ),
-          0
-        );
-
-      const iCount =
-        Math.max(
-          maxIValues,
-          1
-        );
-
-      const qCount =
-        Math.max(
-          maxQValues,
-          1
-        );
-
-      const csiHeader = [
-        "session_id",
-        "timestamp",
-        "elapsed_ms",
-        ...Array.from(
-          {
-            length: iCount,
-          },
-          (_, index) =>
-            `I${index}`
-        ),
-        ...Array.from(
-          {
-            length: qCount,
-          },
-          (_, index) =>
-            `Q${index}`
-        ),
-      ];
-
-      const csiRows =
-        lastSession.samples.map(
-          (sample) => {
-            const elapsedMs =
-              sample.timestamp -
-              sessionStart;
-
-            const iValues =
-              sample.iValues ??
-              [sample.i];
-
-            const qValues =
-              sample.qValues ??
-              [sample.q];
-
-            return [
-              lastSession.sessionId,
-              new Date(
-                sample.timestamp
-              ).toISOString(),
-              elapsedMs,
-              ...Array.from(
-                {
-                  length: iCount,
-                },
-                (_, index) =>
-                  iValues[index] ??
-                  ""
-              ),
-              ...Array.from(
-                {
-                  length: qCount,
-                },
-                (_, index) =>
-                  qValues[index] ??
-                  ""
-              ),
-            ].join(",");
-          }
-        );
-
-      const csiContent = [
-        csiHeader.join(","),
-        ...csiRows,
-      ].join("\n");
-
-      /*
-       * Metadata about the complete session.
-       */
-      const metadata = {
-        project: "Wi-Track",
-        sessionId:
-          lastSession.sessionId,
-        startedAt:
-          lastSession.startedAt,
-        stoppedAt:
-          lastSession.stoppedAt,
-        durationSeconds:
-          lastSession.duration,
-        csiSamples:
-          lastSession.samples.length,
-        yoloResults:
-          yoloHistory.length,
-        modelResults:
-          modelHistory.length,
-        files: [
-          "csi_data.csv",
-          "video.webm",
-          "yolo_results.json",
-          "model_results.json",
-        ],
-      };
-
-      const entries: DownloadEntry[] =
-        [
-          {
-            name: "session_metadata.json",
-            data: textEncoder.encode(
-              JSON.stringify(
-                metadata,
-                null,
-                2
-              )
-            ),
-          },
-          {
-            name: "csi_data.csv",
-            data: textEncoder.encode(
-              csiContent
-            ),
-          },
-          {
-            name: "yolo_results.json",
-            data: textEncoder.encode(
-              JSON.stringify(
-                yoloHistory,
-                null,
-                2
-              )
-            ),
-          },
-          {
-            name: "model_results.json",
-            data: textEncoder.encode(
-              JSON.stringify(
-                modelHistory,
-                null,
-                2
-              )
-            ),
-          },
-        ];
-
-      /*
-       * Add the recorded camera video when
-       * it exists.
-       */
-      if (
-        recordedVideoRef.current
-      ) {
-        entries.push({
-          name: "video.webm",
-          data:
-            await blobToUint8Array(
-              recordedVideoRef.current
-            ),
-        });
+        setVideoStatus("READY");
+        return;
       }
 
-      const zipBlob =
-        createZip(entries);
+      setVideoStatus("READY");
 
       const url =
         URL.createObjectURL(
-          zipBlob
+          mp4Blob
         );
 
       const link =
@@ -1613,7 +2685,7 @@ function Dashboard() {
       link.href = url;
 
       link.download =
-        `${lastSession.sessionId}.zip`;
+        `${lastSession.sessionId}.mp4`;
 
       document.body.appendChild(
         link
