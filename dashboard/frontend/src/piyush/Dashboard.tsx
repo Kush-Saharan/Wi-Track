@@ -42,6 +42,7 @@ interface YOLODetectionView {
 interface SampleCSIFrame {
   iValues: number[];
   qValues: number[];
+  label?: string;
 }
 
 let sampleCSIFramesLoader:
@@ -59,6 +60,8 @@ function parseSampleCSI(
 
   const headers =
     lines[0]?.split(",") ?? [];
+
+  const labelIndex = headers.indexOf("label");
 
   const iColumns =
     headers.flatMap(
@@ -101,10 +104,13 @@ function parseSampleCSI(
         return [];
       }
 
+      const label = labelIndex !== -1 ? cells[labelIndex] : undefined;
+
       return [
         {
           iValues,
           qValues,
+          label,
         },
       ];
     });
@@ -314,6 +320,7 @@ declare global {
   interface Window {
     ort?: OrtRuntime;
     FFmpegWASM?: FFmpegModule;
+    FFmpeg?: FFmpegModule;
   }
 }
 
@@ -516,7 +523,8 @@ async function loadFFmpeg() {
       );
 
       const ffmpegModule =
-        window.FFmpegWASM;
+        window.FFmpegWASM ??
+        window.FFmpeg;
 
       if (!ffmpegModule) {
         throw new Error(
@@ -549,20 +557,20 @@ async function loadFFmpeg() {
             `${ffmpegBaseURL}/814.ffmpeg.js`,
             "text/javascript"
           ),
-        coreURL:
-          await toBlobURL(
-            `${coreBaseURL}/ffmpeg-core.js`,
-            "text/javascript"
-          ),
-        wasmURL:
-          await toBlobURL(
-            `${coreBaseURL}/ffmpeg-core.wasm`,
-            "application/wasm"
-          ),
+        coreURL: `${coreBaseURL}/ffmpeg-core.js`,
+        wasmURL: `${coreBaseURL}/ffmpeg-core.wasm`,
       });
 
       return ffmpeg;
-    })();
+    })().catch((error) => {
+      /*
+       * Reset so the next attempt
+       * retries the load instead of
+       * returning the same rejection.
+       */
+      ffmpegLoader = null;
+      throw error;
+    });
   }
 
   return ffmpegLoader;
@@ -1100,6 +1108,12 @@ function Dashboard() {
   const [cameraName, setCameraName] =
     useState("No camera selected");
 
+  const [yoloEnabled, setYoloEnabled] =
+    useState(true);
+
+  const [modelEnabled, setModelEnabled] =
+    useState(true);
+
   const [videoStatus, setVideoStatus] =
     useState<
       | "IDLE"
@@ -1211,6 +1225,9 @@ function Dashboard() {
 
   const isRecordingRef =
     useRef(false);
+
+  const modelEnabledRef =
+    useRef(true);
 
   /*
    * REAL-TIME recording timer.
@@ -1662,15 +1679,26 @@ function Dashboard() {
 
       sampleIndexRef.current += 1;
 
+      const timestamp = Date.now();
+
       handleCSIData([
         {
-          timestamp: Date.now(),
+          timestamp,
           i: frame.iValues[0] ?? 0,
           q: frame.qValues[0] ?? 0,
           iValues: frame.iValues,
           qValues: frame.qValues,
         },
       ]);
+
+      if (modelEnabledRef.current && frame.label) {
+        handleModelData({
+          timestamp,
+          prediction: frame.label,
+          confidence: 0.95,
+          status: frame.label !== "0" ? "DETECTED" : "WAITING",
+        });
+      }
     };
 
   const drawRecordingCanvases =
@@ -2115,8 +2143,13 @@ function Dashboard() {
       );
     };
 
-  const renderStitchedMp4 =
-    async () => {
+  /*
+   * Stitch camera + CSI graph videos
+   * side-by-side using pure browser APIs.
+   * No ffmpeg needed.
+   */
+  const renderStitchedVideo =
+    async (): Promise<Blob> => {
       if (
         !recordedVideoRef.current ||
         !recordedGraphRef.current
@@ -2126,109 +2159,196 @@ function Dashboard() {
         );
       }
 
-      const ffmpeg =
-        await loadFFmpeg();
+      const HALF_W = 640;
+      const FULL_H = 720;
 
-      await ffmpeg.writeFile(
-        "camera.webm",
-        await blobToUint8Array(
-          recordedVideoRef.current
-        )
-      );
-
-      await ffmpeg.writeFile(
-        "graph.webm",
-        await blobToUint8Array(
-          recordedGraphRef.current
-        )
-      );
-
-      const filter =
-        "[0:v]scale=640:720:force_original_aspect_ratio=decrease,pad=640:720:(ow-iw)/2:(oh-ih)/2:black[left];[1:v]scale=640:720[right];[left][right]hstack=inputs=2[v]";
-
-      try {
-        await ffmpeg.exec([
-          "-i",
-          "camera.webm",
-          "-i",
-          "graph.webm",
-          "-filter_complex",
-          filter,
-          "-map",
-          "[v]",
-          "-an",
-          "-c:v",
-          "libx264",
-          "-pix_fmt",
-          "yuv420p",
-          "-movflags",
-          "faststart",
-          "stitched.mp4",
-        ]);
-      } catch (error) {
-        console.warn(
-          "[Wi-Track] H.264 export failed, retrying MPEG-4 MP4",
-          error
+      const canvas =
+        document.createElement(
+          "canvas"
         );
 
-        await ffmpeg.exec([
-          "-i",
-          "camera.webm",
-          "-i",
-          "graph.webm",
-          "-filter_complex",
-          filter,
-          "-map",
-          "[v]",
-          "-an",
-          "-c:v",
-          "mpeg4",
-          "-q:v",
-          "4",
-          "stitched.mp4",
-        ]);
-      }
+      canvas.width = HALF_W * 2;
+      canvas.height = FULL_H;
 
-      const output =
-        await ffmpeg.readFile(
-          "stitched.mp4"
+      const ctx =
+        canvas.getContext("2d")!;
+
+      const makeVideo = (
+        blob: Blob
+      ): Promise<HTMLVideoElement> =>
+        new Promise((resolve, reject) => {
+          const video =
+            document.createElement(
+              "video"
+            );
+
+          video.muted = true;
+          video.playsInline = true;
+          video.preload = "auto";
+
+          video.onloadeddata = () =>
+            resolve(video);
+
+          video.onerror = () =>
+            reject(
+              new Error(
+                "Failed to load recorded video"
+              )
+            );
+
+          video.src =
+            URL.createObjectURL(blob);
+        });
+
+      const camVideo = await makeVideo(
+        recordedVideoRef.current
+      );
+
+      const graphVideo = await makeVideo(
+        recordedGraphRef.current
+      );
+
+      /*
+       * Record the composite canvas
+       * as a single video stream.
+       */
+      const stream =
+        canvas.captureStream(30);
+
+      const mimeType =
+        MediaRecorder.isTypeSupported(
+          "video/webm;codecs=vp9"
+        )
+          ? "video/webm;codecs=vp9"
+          : "video/webm";
+
+      const recorder =
+        new MediaRecorder(stream, {
+          mimeType,
+          videoBitsPerSecond:
+            4_000_000,
+        });
+
+      const chunks: Blob[] = [];
+
+      recorder.ondataavailable =
+        (event) => {
+          if (event.data.size > 0) {
+            chunks.push(event.data);
+          }
+        };
+
+      const recorderDone =
+        new Promise<Blob>(
+          (resolve) => {
+            recorder.onstop = () => {
+              resolve(
+                new Blob(chunks, {
+                  type: mimeType,
+                })
+              );
+            };
+          }
         );
 
-      await Promise.allSettled([
-        ffmpeg.deleteFile(
-          "camera.webm"
-        ),
-        ffmpeg.deleteFile(
-          "graph.webm"
-        ),
-        ffmpeg.deleteFile(
-          "stitched.mp4"
-        ),
+      recorder.start();
+
+      /*
+       * Play both videos in sync and
+       * composite each frame onto the
+       * canvas until the shorter one
+       * ends.
+       */
+      await Promise.all([
+        camVideo.play(),
+        graphVideo.play(),
       ]);
 
-      if (
-        typeof output === "string"
-      ) {
-        throw new Error(
-          "ffmpeg returned invalid MP4 data"
-        );
-      }
+      await new Promise<void>(
+        (resolve) => {
+          const draw = () => {
+            if (
+              camVideo.ended ||
+              graphVideo.ended
+            ) {
+              recorder.stop();
+              resolve();
+              return;
+            }
 
-      const buffer =
-        new ArrayBuffer(
-          output.byteLength
-        );
+            ctx.fillStyle = "#000";
+            ctx.fillRect(
+              0,
+              0,
+              canvas.width,
+              canvas.height
+            );
 
-      new Uint8Array(buffer).set(
-        output
-      );
+            /*
+             * Camera on the left half.
+             */
+            const camAspect =
+              camVideo.videoWidth /
+              (camVideo.videoHeight ||
+                1);
 
-      return new Blob(
-        [buffer],
-        {
-          type: "video/mp4",
+            let camDrawW = HALF_W;
+            let camDrawH =
+              HALF_W / camAspect;
+
+            if (camDrawH > FULL_H) {
+              camDrawH = FULL_H;
+              camDrawW =
+                FULL_H * camAspect;
+            }
+
+            const camX =
+              (HALF_W - camDrawW) / 2;
+
+            const camY =
+              (FULL_H - camDrawH) / 2;
+
+            ctx.drawImage(
+              camVideo,
+              camX,
+              camY,
+              camDrawW,
+              camDrawH
+            );
+
+            /*
+             * CSI graph on the right
+             * half.
+             */
+            ctx.drawImage(
+              graphVideo,
+              HALF_W,
+              0,
+              HALF_W,
+              FULL_H
+            );
+
+            requestAnimationFrame(
+              draw
+            );
+          };
+
+          requestAnimationFrame(draw);
         }
       );
+
+      /*
+       * Clean up object URLs.
+       */
+      URL.revokeObjectURL(
+        camVideo.src
+      );
+
+      URL.revokeObjectURL(
+        graphVideo.src
+      );
+
+      return recorderDone;
     };
 
   /*
@@ -2319,6 +2439,20 @@ function Dashboard() {
       "[Wi-Track] YOLO data received:",
       data
     );
+  };
+
+  /*
+   * MODEL sample handler.
+   */
+  const handleModelData = (
+    data: ModelData
+  ) => {
+    setModelHistory((previous) => [
+      ...previous,
+      data,
+    ]);
+
+    setCurrentModel(data);
   };
 
   /*
@@ -2428,8 +2562,6 @@ function Dashboard() {
 
       sampleIndexRef.current = 0;
 
-      stopSampleCSI();
-
       setConnectionStatus(
         "CONNECTED"
       );
@@ -2515,7 +2647,9 @@ function Dashboard() {
 
     startRenderLoop();
 
-    startYOLO();
+    if (yoloEnabled) {
+      startYOLO();
+    }
   };
 
   /*
@@ -2642,8 +2776,9 @@ function Dashboard() {
   };
 
   /*
-   * Download the stitched MP4 generated
+   * Download the stitched video generated
    * from the camera and CSI graph streams.
+   * Uses pure canvas stitching (no ffmpeg).
    */
   const handleDownload =
     async () => {
@@ -2655,51 +2790,73 @@ function Dashboard() {
         "PROCESSING"
       );
 
-      let mp4Blob: Blob;
+      const downloadBlob = (
+        blob: Blob,
+        filename: string
+      ) => {
+        const url =
+          URL.createObjectURL(
+            blob
+          );
+
+        const link =
+          document.createElement(
+            "a"
+          );
+
+        link.href = url;
+        link.download = filename;
+
+        document.body.appendChild(
+          link
+        );
+
+        link.click();
+        link.remove();
+
+        window.setTimeout(() => {
+          URL.revokeObjectURL(
+            url
+          );
+        }, 1000);
+      };
 
       try {
-        mp4Blob =
-          await renderStitchedMp4();
+        const stitchedBlob =
+          await renderStitchedVideo();
+
+        setVideoStatus("READY");
+
+        downloadBlob(
+          stitchedBlob,
+          `${lastSession.sessionId}.webm`
+        );
       } catch (error) {
-        console.error(
-          "[Wi-Track] MP4 export failed:",
+        console.warn(
+          "[Wi-Track] Stitched export failed, falling back to separate files:",
           error
         );
 
         setVideoStatus("READY");
-        return;
+
+        if (
+          recordedVideoRef.current
+        ) {
+          downloadBlob(
+            recordedVideoRef.current,
+            `${lastSession.sessionId}_camera.webm`
+          );
+        }
+
+        if (
+          recordedGraphRef.current
+        ) {
+          downloadBlob(
+            recordedGraphRef.current,
+            `${lastSession.sessionId}_csi.webm`
+          );
+        }
       }
-
-      setVideoStatus("READY");
-
-      const url =
-        URL.createObjectURL(
-          mp4Blob
-        );
-
-      const link =
-        document.createElement(
-          "a"
-        );
-
-      link.href = url;
-
-      link.download =
-        `${lastSession.sessionId}.mp4`;
-
-      document.body.appendChild(
-        link
-      );
-
-      link.click();
-
-      link.remove();
-
-      window.setTimeout(() => {
-        URL.revokeObjectURL(
-          url
-        );
-      }, 1000);
     };
 
 
@@ -3191,19 +3348,70 @@ function Dashboard() {
             </button>
 
             <button
-              className="control-button"
+              className={`control-button${
+                modelEnabled
+                  ? " model-active"
+                  : ""
+              }`}
               type="button"
+              onClick={() => {
+                setModelEnabled(
+                  (prev) => {
+                    const next = !prev;
+                    modelEnabledRef.current = next;
+                    if (!next && isRecordingRef.current) {
+                      setCurrentModel(null);
+                    }
+                    return next;
+                  }
+                );
+              }}
             >
               <span>◆</span>
-              MODEL
+              MODEL{" "}
+              {modelEnabled
+                ? "ON"
+                : "OFF"}
             </button>
 
             <button
-              className="control-button"
+              className={`control-button${
+                yoloEnabled
+                  ? " yolo-active"
+                  : ""
+              }`}
               type="button"
+              onClick={() => {
+                setYoloEnabled(
+                  (prev) => {
+                    const next =
+                      !prev;
+
+                    if (
+                      isRecordingRef.current
+                    ) {
+                      if (next) {
+                        startYOLO();
+                      } else {
+                        stopYOLO();
+                        currentYOLORef.current =
+                          null;
+                        setCurrentYOLO(
+                          null
+                        );
+                      }
+                    }
+
+                    return next;
+                  }
+                );
+              }}
             >
               <span>◇</span>
-              YOLO
+              YOLO{" "}
+              {yoloEnabled
+                ? "ON"
+                : "OFF"}
             </button>
 
             <button

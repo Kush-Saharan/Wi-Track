@@ -1,5 +1,7 @@
 .witrack-dashboard {
   min-height: 100vh;
+  max-height: 100vh;
+  overflow-y: auto;
   background: #080b10;
   color: #e8edf5;
   font-family:
@@ -13,13 +15,14 @@
 }
 
 .witrack-header {
-  height: 72px;
+  height: 56px;
   padding: 0 32px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid #202630;
   background: #0c1016;
+  flex-shrink: 0;
 }
 
 .witrack-logo {
@@ -53,21 +56,29 @@
 
 .witrack-main {
   width: 100%;
-  padding: 24px;
+  height: calc(100vh - 56px);
+  padding: 16px 24px;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
 }
 
 .top-section {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 180px;
-  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) 160px;
+  gap: 16px;
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 .visualization-area {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  grid-template-rows: 330px 145px;
-  gap: 20px;
+  grid-template-rows: 1fr auto;
+  gap: 16px;
+  min-height: 0;
 }
 
 .panel {
@@ -75,10 +86,13 @@
   background: #0d1219;
   border-radius: 8px;
   overflow: hidden;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-header {
-  height: 45px;
+  height: 40px;
   padding: 0 16px;
   box-sizing: border-box;
   display: flex;
@@ -89,6 +103,7 @@
   font-weight: 700;
   letter-spacing: 1.5px;
   color: #aeb8c7;
+  flex-shrink: 0;
 }
 
 .panel-status {
@@ -101,7 +116,8 @@
 }
 
 .camera-content {
-  height: calc(100% - 45px);
+  flex: 1 1 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -163,7 +179,8 @@
 
 .csi-graph {
   position: relative;
-  height: calc(100% - 45px);
+  flex: 1 1 0;
+  min-height: 0;
   overflow: hidden;
 }
 
