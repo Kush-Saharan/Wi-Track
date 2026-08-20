@@ -46,17 +46,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
                 await websocket.send_json(csi_payload)
 
-                # ====================================================
-                # TEAMMATE MODEL PLUGIN PLACEHOLDER
-                # Your teammate can add model prediction here:
-                # pred, conf = model.predict(packet.amplitudes)
-                # await websocket.send_json({
-                #     "type": "model",
-                #     "prediction": pred,
-                #     "confidence": conf,
-                #     "timestamp": packet.timestamp
-                # })
-                # ====================================================
+                # Model plugin
 
             await asyncio.sleep(0.001)
 
