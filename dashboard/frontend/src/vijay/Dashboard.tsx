@@ -12,7 +12,7 @@ import type {
   ModelData,
 } from "./websocket";
 
-const WS_URL = "ws://localhost:8000/ws";
+const WS_URL = "ws://localhost:8000/ws/data";
 
 const MAX_GRAPH_POINTS = 192;
 
